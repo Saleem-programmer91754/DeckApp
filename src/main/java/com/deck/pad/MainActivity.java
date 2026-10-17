@@ -46,14 +46,29 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.ConnectException;
 import java.net.HttpURLConnection;
+import java.net.Inet4Address;
+import java.net.InetAddress;
+import java.net.InterfaceAddress;
+import java.net.NetworkInterface;
+import java.net.NoRouteToHostException;
+import java.net.SocketException;
+import java.net.SocketTimeoutException;
 import java.net.URL;
+import java.net.UnknownHostException;
 import java.nio.charset.Charset;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CompletionService;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -92,6 +107,10 @@ public class MainActivity extends Activity {
     private JSONObject cfg;
     private int page = 0;
 
+    private static final int PORT = 8765;
+    private final Object lock = new Object();
+    private volatile String lastGood = "";
+
     private final ExecutorService iconPool = Executors.newFixedThreadPool(2);
     private final Map<String, Bitmap> memIcons = new ConcurrentHashMap<String, Bitmap>();
     private final Set<String> failedIcons = Collections.synchronizedSet(new HashSet<String>());
@@ -100,8 +119,10 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        System.setProperty("http.keepAlive", "false");
         prefs = getSharedPreferences("deck", MODE_PRIVATE);
         page = prefs.getInt("page", 0);
+        lastGood = prefs.getString("last", "");
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -137,7 +158,7 @@ public class MainActivity extends Activity {
         }
         render();
 
-        if (prefs.getString("host", "").length() == 0) {
+        if (prefs.getString("key", "").length() == 0) {
             openSettings();
         }
     }
@@ -145,7 +166,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
-        if (prefs.getString("host", "").length() > 0) {
+        if (prefs.getString("key", "").length() > 0) {
             refresh();
         }
     }
@@ -225,8 +246,8 @@ public class MainActivity extends Activity {
         grid.removeAllViews();
         JSONArray pages = cfg == null ? null : cfg.optJSONArray("pages");
         if (pages == null || pages.length() == 0) {
-            message(prefs.getString("host", "").length() == 0
-                    ? "أهلاً! من القائمة (⋮) اختر \"الإعدادات\" واكتب عنوان الكمبيوتر والرمز."
+            message(prefs.getString("key", "").length() == 0
+                    ? "أهلاً! من القائمة (⋮) اختر \"الإعدادات\" واكتب الرمز اللي بيظهر بنافذة start.bat."
                     : "ما في أزرار بعد. تأكد إنك شغّلت start.bat على الكمبيوتر.");
             return;
         }
@@ -455,7 +476,7 @@ public class MainActivity extends Activity {
                         public void run() {
                             cfg = fresh;
                             render();
-                            setStatus(1, "متصل");
+                            setStatus(1, "متصل " + lastGood.replace(":" + PORT, ""));
                         }
                     });
                 } catch (final Exception e) {
@@ -467,7 +488,8 @@ public class MainActivity extends Activity {
                                 grid.removeAllViews();
                                 message(e.getMessage()
                                         + "\n\n• شغّل start.bat على الكمبيوتر\n"
-                                        + "• نفس الـ WiFi\n• تأكد من العنوان والرمز بالإعدادات");
+                                        + "• نفس الـ WiFi، أو وصّل كابل USB وفعّل USB Tethering\n"
+                                        + "• تأكد من الرمز بالإعدادات");
                             } else {
                                 toast(e.getMessage());
                             }
@@ -533,18 +555,54 @@ public class MainActivity extends Activity {
         }).start();
     }
 
+    /** Server answered with an error (wrong code, bad button...). Not a network problem. */
+    private static class HttpFail extends Exception {
+        HttpFail(String msg) {
+            super(msg);
+        }
+    }
+
+    /**
+     * Talks to the PC. The PC is found automatically (WiFi or USB tethering) and
+     * searched for again if the link drops or its address changes.
+     */
     private byte[] httpBytes(String method, String path, byte[] body) throws Exception {
-        String host = prefs.getString("host", "");
+        String host = lastGood;
         if (host.length() == 0) {
-            throw new Exception("اكتب عنوان الكمبيوتر من الإعدادات");
+            host = findHost();
+            if (host == null) {
+                throw new Exception("ما لقيت الكمبيوتر. شغّل start.bat وتأكد من الـ WiFi أو كابل USB (Tethering)");
+            }
         }
-        if (host.indexOf(':') < 0) {
-            host = host + ":8765";
+        try {
+            return request(host, method, path, body);
+        } catch (IOException first) {
+            // A press must not run twice: only retry when the connection never opened.
+            boolean neverConnected = first instanceof ConnectException
+                    || first instanceof NoRouteToHostException
+                    || first instanceof UnknownHostException;
+            if (!"GET".equals(method) && !neverConnected) {
+                throw new Exception("انقطع الاتصال بالكمبيوتر");
+            }
+            lastGood = "";
+            String again = findHost();
+            if (again == null) {
+                throw new Exception("تعذّر الاتصال بالكمبيوتر");
+            }
+            try {
+                return request(again, method, path, body);
+            } catch (IOException second) {
+                throw new Exception("تعذّر الاتصال بالكمبيوتر");
+            }
         }
+    }
+
+    private byte[] request(String host, String method, String path, byte[] body)
+            throws IOException, HttpFail {
         HttpURLConnection c = null;
         try {
             c = (HttpURLConnection) new URL("http://" + host + path).openConnection();
-            c.setConnectTimeout(4000);
+            c.setConnectTimeout(3000);
             c.setReadTimeout(15000);
             c.setRequestMethod(method);
             c.setRequestProperty("X-Deck-Key", prefs.getString("key", ""));
@@ -552,12 +610,20 @@ public class MainActivity extends Activity {
                 c.setDoOutput(true);
                 c.setRequestProperty("Content-Type", "application/json; charset=utf-8");
                 c.setFixedLengthStreamingMode(body.length);
+            } else if ("POST".equals(method)) {
+                c.setDoOutput(true);
+                c.setFixedLengthStreamingMode(0);
+            }
+            try {
+                c.connect();
+            } catch (SocketTimeoutException e) {
+                throw new ConnectException("connect timeout");
+            }
+            if (body != null) {
                 OutputStream o = c.getOutputStream();
                 o.write(body);
                 o.close();
             } else if ("POST".equals(method)) {
-                c.setDoOutput(true);
-                c.setFixedLengthStreamingMode(0);
                 c.getOutputStream().close();
             }
             int code = c.getResponseCode();
@@ -568,16 +634,118 @@ public class MainActivity extends Activity {
                     msg = new JSONObject(msg).optString("msg", msg);
                 } catch (Exception ignored) {
                 }
-                throw new Exception(msg.length() == 0 ? "خطأ " + code : msg);
+                throw new HttpFail(msg.length() == 0 ? "خطأ " + code : msg);
             }
             return data;
-        } catch (IOException e) {
-            throw new Exception("تعذّر الاتصال بالكمبيوتر");
         } finally {
             if (c != null) {
                 c.disconnect();
             }
         }
+    }
+
+    /** True if a Deck server answers at host:port. */
+    private boolean ping(String hostPort, int timeoutMs) {
+        HttpURLConnection c = null;
+        try {
+            c = (HttpURLConnection) new URL("http://" + hostPort + "/api/ping").openConnection();
+            c.setConnectTimeout(timeoutMs);
+            c.setReadTimeout(timeoutMs + 700);
+            if (c.getResponseCode() != 200) {
+                return false;
+            }
+            return new String(readAll(c.getInputStream()), "UTF-8").contains("\"deck\"");
+        } catch (Exception e) {
+            return false;
+        } finally {
+            if (c != null) {
+                c.disconnect();
+            }
+        }
+    }
+
+    private List<String> manualHosts() {
+        List<String> out = new ArrayList<String>();
+        for (String h : prefs.getString("host", "").split("[\\s,;]+")) {
+            if (h.length() > 0 && !h.equalsIgnoreCase("auto")) {
+                out.add(h.indexOf(':') < 0 ? h + ":" + PORT : h);
+            }
+        }
+        return out;
+    }
+
+    private String remember(String hostPort) {
+        lastGood = hostPort;
+        prefs.edit().putString("last", hostPort).apply();
+        return hostPort;
+    }
+
+    /** Looks for the PC: the last address, typed addresses, then every nearby address. */
+    private String findHost() {
+        synchronized (lock) {
+            if (lastGood.length() > 0 && ping(lastGood, 800)) {
+                return lastGood;
+            }
+            lastGood = "";
+            for (String h : manualHosts()) {
+                if (ping(h, 1200)) {
+                    return remember(h);
+                }
+            }
+            String found = scan();
+            return found == null ? null : remember(found);
+        }
+    }
+
+    /** Tries all 254 addresses of each network this phone is on (WiFi, USB tethering...). */
+    private String scan() {
+        Set<String> targets = new LinkedHashSet<String>();
+        try {
+            for (NetworkInterface ni : Collections.list(NetworkInterface.getNetworkInterfaces())) {
+                String name = ni.getName().toLowerCase();
+                if (!ni.isUp() || ni.isLoopback() || name.startsWith("rmnet") || name.startsWith("ccmni")
+                        || name.startsWith("pdp") || name.startsWith("tun") || name.startsWith("dummy")) {
+                    continue;
+                }
+                for (InterfaceAddress ia : ni.getInterfaceAddresses()) {
+                    InetAddress a = ia.getAddress();
+                    if (!(a instanceof Inet4Address)) {
+                        continue;
+                    }
+                    byte[] b = a.getAddress();
+                    String base = (b[0] & 255) + "." + (b[1] & 255) + "." + (b[2] & 255) + ".";
+                    for (int i = 1; i < 255; i++) {
+                        if (i != (b[3] & 255)) {
+                            targets.add(base + i + ":" + PORT);
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            return null;
+        }
+        if (targets.isEmpty()) {
+            return null;
+        }
+        ExecutorService ex = Executors.newFixedThreadPool(48);
+        CompletionService<String> cs = new ExecutorCompletionService<String>(ex);
+        for (final String t : targets) {
+            cs.submit(new Callable<String>() {
+                @Override
+                public String call() {
+                    return ping(t, 450) ? t : null;
+                }
+            });
+        }
+        String found = null;
+        try {
+            for (int i = 0; i < targets.size() && found == null; i++) {
+                found = cs.take().get();
+            }
+        } catch (Exception ignored) {
+        }
+        ex.shutdownNow();
+        return found;
     }
 
     private static byte[] readAll(InputStream in) throws IOException {
@@ -611,15 +779,18 @@ public class MainActivity extends Activity {
 
     private void openSettings() {
         LinearLayout form = form();
-        final EditText host = field("مثال: 192.168.1.5", prefs.getString("host", ""));
+        final EditText host = field("فاضي = بحث تلقائي", prefs.getString("host", ""));
         final EditText key = field("الرمز (6 أحرف)", prefs.getString("key", ""));
         key.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS
                 | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
-        form.addView(label("عنوان الكمبيوتر"));
-        form.addView(host);
         form.addView(label("الرمز"));
         form.addView(key);
-        form.addView(help("الاتنين بيظهروا بنافذة start.bat على الكمبيوتر. الموبايل والكمبيوتر لازم يكونوا على نفس الـ WiFi."));
+        form.addView(help("بيظهر بنافذة start.bat على الكمبيوتر."));
+        form.addView(label("عنوان الكمبيوتر (اختياري)"));
+        form.addView(host);
+        form.addView(help("اتركه فاضي: التطبيق بيلاقي الكمبيوتر لحاله عبر الـ WiFi أو كابل USB، "
+                + "وبيرجع يدوّر عليه إذا تغيّر العنوان. للـ USB: وصّل الكابل وفعّل USB Tethering "
+                + "من إعدادات الموبايل. وإذا بدك تحدد عنوان يدوياً، اكتبه هون (ممكن أكتر من عنوان)."));
 
         builder().setTitle("الاتصال بالكمبيوتر")
                 .setView(scroll(form))
@@ -628,12 +799,11 @@ public class MainActivity extends Activity {
                     public void onClick(DialogInterface d, int w) {
                         String h = host.getText().toString().trim()
                                 .replace("http://", "").replace("https://", "");
-                        while (h.endsWith("/")) {
-                            h = h.substring(0, h.length() - 1);
-                        }
                         prefs.edit().putString("host", h)
                                 .putString("key", key.getText().toString().trim().toUpperCase())
+                                .remove("last")
                                 .apply();
+                        lastGood = "";
                         refresh();
                     }
                 })
