@@ -13,6 +13,7 @@ import android.graphics.Paint;
 import android.graphics.Typeface;
 import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.LayerDrawable;
 import android.graphics.drawable.StateListDrawable;
 import android.net.wifi.WifiManager;
 import android.os.Bundle;
@@ -171,12 +172,12 @@ public class MainActivity extends Activity {
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(C_BG);
+        root.setBackground(neonBackground());
         root.addView(buildBar(), new LinearLayout.LayoutParams(MATCH, WRAP));
 
         HorizontalScrollView tabScroll = new HorizontalScrollView(this);
         tabScroll.setHorizontalScrollBarEnabled(false);
-        tabScroll.setBackgroundColor(C_BAR);
+        tabScroll.setBackgroundColor(0x00000000);
         tabs = new LinearLayout(this);
         tabs.setOrientation(LinearLayout.HORIZONTAL);
         tabs.setPadding(dp(6), 0, dp(6), dp(6));
@@ -279,7 +280,7 @@ public class MainActivity extends Activity {
         LinearLayout bar = new LinearLayout(this);
         bar.setOrientation(LinearLayout.HORIZONTAL);
         bar.setGravity(Gravity.CENTER_VERTICAL);
-        bar.setBackgroundColor(C_BAR);
+        bar.setBackgroundColor(0x33000000);
         bar.setPadding(dp(14), dp(2), dp(2), dp(2));
 
         TextView title = new TextView(this);
@@ -409,7 +410,7 @@ public class MainActivity extends Activity {
         boolean sel = idx == page;
         t.setTextColor(sel ? Color.WHITE : C_GRAY);
         t.setTypeface(null, sel ? Typeface.BOLD : Typeface.NORMAL);
-        t.setBackground(stateBg(sel ? 0xFF3A3A3A : 0x00000000, 0xFF2A2A2A, 18));
+        t.setBackground(sel ? glassBg(0xFF00F0FF, 18) : stateBg(0x00000000, 0x22FFFFFF, 18));
         t.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -443,7 +444,7 @@ public class MainActivity extends Activity {
         t.setGravity(Gravity.CENTER);
         t.setPadding(dp(4), dp(6), dp(4), dp(6));
         int color = parseColor(b.optString("color", ""));
-        t.setBackground(stateBg(color, darker(color), 14));
+        t.setBackground(glassBg(color, 18));
 
         String ik = b.optString("_ik", "");
         final ImageView iv = new ImageView(this);
@@ -459,6 +460,7 @@ public class MainActivity extends Activity {
         tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, ik.length() > 0 ? 13 : 18);
         tv.setTypeface(null, Typeface.BOLD);
         tv.setGravity(Gravity.CENTER);
+        tv.setShadowLayer(dp(6), 0, 0, neon(color));
         tv.setMaxLines(2);
         tv.setEllipsize(TextUtils.TruncateAt.END);
         t.addView(tv, new LinearLayout.LayoutParams(MATCH, WRAP));
@@ -488,12 +490,12 @@ public class MainActivity extends Activity {
 
     private View makeAddTile() {
         GradientDrawable d = new GradientDrawable();
-        d.setColor(0xFF1A1A1A);
-        d.setCornerRadius(dp(14));
-        d.setStroke(dp(2), 0xFF444444, dp(6), dp(4));
+        d.setColor(0x14FFFFFF);
+        d.setCornerRadius(dp(18));
+        d.setStroke(dp(2), 0x8800F0FF, dp(6), dp(4));
         TextView t = new TextView(this);
         t.setText("+");
-        t.setTextColor(0xFF777777);
+        t.setTextColor(0xCC00F0FF);
         t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 36);
         t.setGravity(Gravity.CENTER);
         t.setBackground(d);
@@ -1521,6 +1523,56 @@ public class MainActivity extends Activity {
         Color.colorToHSV(color, hsv);
         hsv[2] *= 0.7f;
         return Color.HSVToColor(hsv);
+    }
+
+    private static int neon(int color) {
+        float[] hsv = new float[3];
+        Color.colorToHSV(color, hsv);
+        hsv[1] = Math.max(hsv[1], 0.55f);
+        hsv[2] = Math.max(hsv[2], 0.95f);
+        return Color.HSVToColor(hsv);
+    }
+
+    private static int withAlpha(int color, int a) {
+        return (a << 24) | (color & 0x00FFFFFF);
+    }
+
+    /** One "liquid glass" layer: tinted translucent body, neon edge and a soft white sheen on top. */
+    private android.graphics.drawable.Drawable glassLayer(int color, boolean pressed, int radiusDp) {
+        int c = neon(color);
+        GradientDrawable base = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[]{withAlpha(c, pressed ? 0xAA : 0x66), withAlpha(c, pressed ? 0x66 : 0x22)});
+        base.setCornerRadius(dp(radiusDp));
+        base.setStroke(dp(pressed ? 2 : 1), withAlpha(c, pressed ? 0xFF : 0xCC));
+        GradientDrawable sheen = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[]{0x55FFFFFF, 0x10FFFFFF, 0x00FFFFFF});
+        sheen.setCornerRadius(dp(radiusDp));
+        LayerDrawable ld = new LayerDrawable(new android.graphics.drawable.Drawable[]{base, sheen});
+        ld.setLayerInset(1, dp(2), dp(2), dp(2), dp(2));
+        return ld;
+    }
+
+    private StateListDrawable glassBg(int color, int radiusDp) {
+        StateListDrawable s = new StateListDrawable();
+        s.addState(new int[]{android.R.attr.state_pressed}, glassLayer(color, true, radiusDp));
+        s.addState(new int[]{}, glassLayer(color, false, radiusDp));
+        return s;
+    }
+
+    private android.graphics.drawable.Drawable neonBackground() {
+        GradientDrawable base = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
+                new int[]{0xFF070914, 0xFF0B0F24, 0xFF120A22});
+        GradientDrawable a = new GradientDrawable();
+        a.setGradientType(GradientDrawable.RADIAL_GRADIENT);
+        a.setGradientRadius(dp(280));
+        a.setGradientCenter(0.1f, 0.05f);
+        a.setColors(new int[]{0x4400F0FF, 0x0000F0FF});
+        GradientDrawable b = new GradientDrawable();
+        b.setGradientType(GradientDrawable.RADIAL_GRADIENT);
+        b.setGradientRadius(dp(300));
+        b.setGradientCenter(0.95f, 0.95f);
+        b.setColors(new int[]{0x44FF28C8, 0x00FF28C8});
+        return new LayerDrawable(new android.graphics.drawable.Drawable[]{base, a, b});
     }
 
     private StateListDrawable stateBg(int normal, int pressed, int radiusDp) {
